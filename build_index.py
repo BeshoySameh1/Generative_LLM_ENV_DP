@@ -1,17 +1,22 @@
 """
 build_index.py
 ----------------
-Run this ONCE (locally or in a notebook) whenever you add/update PDFs.
-It reads every PDF inside the pdfs/ folder, extracts text, splits it into
-overlapping chunks, embeds them with MiniLM, and saves:
-    - product_index.faiss   (the vector index)
-    - chunks.pkl            (the raw text chunks, aligned with the index)
+Run this ONCE (in Colab or locally) whenever you add/update PDFs.
+
+Improvements over v1:
+- Extracts TABLES properly (pdfplumber's extract_tables), turning each row
+  into a clean, self-contained sentence — instead of letting table text get
+  mangled by plain text extraction.
+- Falls back to plain paragraph text for any non-table content on the page.
+- Chunks tables per-row (one product = one chunk) so facts like price/type
+  never get split away from the product they belong to.
 
 Usage:
     python build_index.py
 
-Then commit product_index.faiss + chunks.pkl to your GitHub repo alongside
-app.py so the deployed app can load them directly (no PDFs needed at runtime).
+Outputs (commit both to your GitHub repo, same folder as app.py):
+    - product_index.faiss
+    - chunks.pkl
 """
 
 import os
@@ -27,41 +32,81 @@ INDEX_PATH = "product_index.faiss"
 CHUNKS_PATH = "chunks.pkl"
 EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
-CHUNK_SIZE = 500       # characters per chunk (roughly ~100-120 tokens)
-CHUNK_OVERLAP = 80     # overlap between consecutive chunks
+# Fallback chunking for plain paragraph text (non-table content)
+TEXT_CHUNK_SIZE = 500
+TEXT_CHUNK_OVERLAP = 80
 
 
-def extract_text_from_pdf(path):
-    """Extract raw text from a single PDF file, page by page."""
-    text = ""
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text() or ""
-            text += page_text + "\n"
-    return text
+def clean_cell(value):
+    """Normalize a table cell's text."""
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
 
 
-def clean_text(text):
-    """Collapse excessive whitespace/newlines."""
-    text = re.sub(r"\n{2,}", "\n", text)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    return text.strip()
-
-
-def chunk_text(text, source_name, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+def row_to_sentence(header, row):
     """
-    Simple sliding-window chunker over characters.
-    Each chunk stores which source PDF it came from, so answers can be
-    traced back later if needed.
+    Turn a table row into a clean, self-contained natural-language sentence
+    using the header labels, e.g.:
+        "Name: Botox Metox | Type: Botulinum toxin | Price: 1200 EGP"
+    This keeps every fact about one product together in a single chunk.
+    """
+    parts = []
+    for col_name, cell_value in zip(header, row):
+        col_name = clean_cell(col_name)
+        cell_value = clean_cell(cell_value)
+        if col_name and cell_value:
+            parts.append(f"{col_name}: {cell_value}")
+    return " | ".join(parts)
+
+
+def extract_tables_as_chunks(pdf_path, source_name):
+    """Extract every table in the PDF, one chunk per data row."""
+    chunks = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            tables = page.extract_tables()
+            for table in tables:
+                if not table or len(table) < 2:
+                    continue  # need at least a header + one data row
+                header = table[0]
+                for row in table[1:]:
+                    sentence = row_to_sentence(header, row)
+                    if sentence:
+                        chunks.append({
+                            "text": sentence,
+                            "source": source_name,
+                            "page": page_num,
+                            "type": "table_row",
+                        })
+    return chunks
+
+
+def extract_plain_text_as_chunks(pdf_path, source_name):
+    """
+    Extract non-table paragraph text (e.g. descriptions, intro text, FAQ)
+    using a sliding-window chunker, in case the PDF has prose sections too.
     """
     chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append({"text": chunk, "source": source_name})
-        start += chunk_size - overlap
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            text = re.sub(r"\n{2,}", "\n", text)
+            text = re.sub(r"[ \t]{2,}", " ", text).strip()
+            if not text:
+                continue
+            start = 0
+            while start < len(text):
+                end = start + TEXT_CHUNK_SIZE
+                chunk_text = text[start:end].strip()
+                if chunk_text:
+                    chunks.append({
+                        "text": chunk_text,
+                        "source": source_name,
+                        "page": page_num,
+                        "type": "paragraph",
+                    })
+                start += TEXT_CHUNK_SIZE - TEXT_CHUNK_OVERLAP
     return chunks
 
 
@@ -80,15 +125,19 @@ def main():
     all_chunks = []
     for fname in pdf_files:
         path = os.path.join(PDF_FOLDER, fname)
-        print(f"  Extracting: {fname}")
-        raw_text = extract_text_from_pdf(path)
-        cleaned = clean_text(raw_text)
-        file_chunks = chunk_text(cleaned, source_name=fname)
-        print(f"    -> {len(file_chunks)} chunks")
-        all_chunks.extend(file_chunks)
+        print(f"\nProcessing: {fname}")
+
+        table_chunks = extract_tables_as_chunks(path, fname)
+        print(f"  Table rows extracted: {len(table_chunks)}")
+
+        text_chunks = extract_plain_text_as_chunks(path, fname)
+        print(f"  Paragraph chunks extracted: {len(text_chunks)}")
+
+        all_chunks.extend(table_chunks)
+        all_chunks.extend(text_chunks)
 
     if not all_chunks:
-        raise SystemExit("No text could be extracted from the PDFs. Are they scanned images?")
+        raise SystemExit("No content could be extracted. Are the PDFs scanned images?")
 
     print(f"\nTotal chunks: {len(all_chunks)}")
     print(f"Loading embedding model: {EMBED_MODEL_NAME}")
@@ -96,9 +145,7 @@ def main():
 
     texts = [c["text"] for c in all_chunks]
     print("Embedding chunks...")
-    embeddings = embedder.encode(
-        texts, convert_to_numpy=True, show_progress_bar=True
-    )
+    embeddings = embedder.encode(texts, convert_to_numpy=True, show_progress_bar=True)
 
     dim = embeddings.shape[1]
     index = faiss.IndexFlatL2(dim)
@@ -110,7 +157,13 @@ def main():
 
     print(f"\nSaved index to '{INDEX_PATH}'")
     print(f"Saved chunks to '{CHUNKS_PATH}'")
-    print("\nDone. Commit both files to your GitHub repo along with app.py.")
+
+    # Quick sanity preview
+    print("\n--- Sample chunks ---")
+    for c in all_chunks[:5]:
+        print(f"[{c['type']}] {c['text'][:150]}")
+
+    print("\nDone. Commit product_index.faiss + chunks.pkl to your GitHub repo.")
 
 
 if __name__ == "__main__":
