@@ -28,7 +28,7 @@ from transformers import (
 INDEX_PATH = "product_index.faiss"
 CHUNKS_PATH = "chunks.pkl"
 EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-GEN_MODEL_NAME = "google/flan-t5-large"        # upgraded from base -> large
+GEN_MODEL_NAME = "google/flan-t5-base"         # large caused OOM kills on free-tier hosting
 QA_MODEL_NAME = "deepset/roberta-base-squad2"  # extractive QA
 
 TOP_K = 5                     # retrieve more chunks now that they're smaller/cleaner
