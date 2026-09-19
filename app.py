@@ -16,13 +16,15 @@ the same folder as this file.
 
 import pickle
 
+import torch
 import faiss
 import streamlit as st
 from sentence_transformers import SentenceTransformer
 from transformers import (
     T5Tokenizer,
     T5ForConditionalGeneration,
-    pipeline,
+    AutoTokenizer,
+    AutoModelForQuestionAnswering,
 )
 
 INDEX_PATH = "product_index.faiss"
@@ -43,16 +45,20 @@ def load_everything():
     gen_tokenizer = T5Tokenizer.from_pretrained(GEN_MODEL_NAME)
     gen_model = T5ForConditionalGeneration.from_pretrained(GEN_MODEL_NAME)
 
-    qa_pipeline = pipeline("question-answering", model=QA_MODEL_NAME)
+    # transformers v5 removed the pipeline("question-answering", ...) shortcut,
+    # so we load the QA model/tokenizer directly and extract the answer span ourselves.
+    qa_tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
+    qa_model = AutoModelForQuestionAnswering.from_pretrained(QA_MODEL_NAME)
+    qa_model.eval()
 
     index = faiss.read_index(INDEX_PATH)
     with open(CHUNKS_PATH, "rb") as f:
         chunks = pickle.load(f)
 
-    return embedder, gen_tokenizer, gen_model, qa_pipeline, index, chunks
+    return embedder, gen_tokenizer, gen_model, qa_tokenizer, qa_model, index, chunks
 
 
-embedder, gen_tokenizer, gen_model, qa_pipeline, index, chunks = load_everything()
+embedder, gen_tokenizer, gen_model, qa_tokenizer, qa_model, index, chunks = load_everything()
 
 
 def retrieve(query, k=TOP_K):
@@ -70,6 +76,43 @@ def retrieve(query, k=TOP_K):
 def build_context(retrieved_chunks, max_chars=MAX_CONTEXT_CHARS):
     context = "\n".join(c["text"] for c in retrieved_chunks)
     return context[:max_chars]
+
+
+def extractive_answer(question, context):
+    """
+    Manual replacement for the (removed-in-v5) pipeline("question-answering", ...).
+    Runs the QA model directly and extracts the highest-scoring answer span.
+    Returns (answer_text, confidence_score).
+    """
+    inputs = qa_tokenizer(
+        question,
+        context,
+        return_tensors="pt",
+        truncation=True,
+        max_length=384,
+    )
+    with torch.no_grad():
+        outputs = qa_model(**inputs)
+
+    start_logits = outputs.start_logits[0]
+    end_logits = outputs.end_logits[0]
+
+    start_idx = int(torch.argmax(start_logits))
+    end_idx = int(torch.argmax(end_logits))
+
+    if end_idx < start_idx:
+        return "", 0.0
+
+    input_ids = inputs["input_ids"][0]
+    answer_tokens = input_ids[start_idx:end_idx + 1]
+    answer = qa_tokenizer.decode(answer_tokens, skip_special_tokens=True).strip()
+
+    # Rough confidence: combined softmax probability of the chosen start/end positions
+    start_probs = torch.softmax(start_logits, dim=0)
+    end_probs = torch.softmax(end_logits, dim=0)
+    score = float(start_probs[start_idx] * end_probs[end_idx])
+
+    return answer, score
 
 
 def generative_answer(question, context):
@@ -96,13 +139,12 @@ def answer_question(question):
 
     # Step 1: try extractive QA first — best for precise facts (price, type, etc.)
     try:
-        qa_result = qa_pipeline(question=question, context=context)
+        ext_answer, ext_score = extractive_answer(question, context)
     except Exception:
-        qa_result = {"score": 0.0, "answer": ""}
+        ext_answer, ext_score = "", 0.0
 
-    if qa_result["score"] >= EXTRACTIVE_CONFIDENCE_THRESHOLD and qa_result["answer"].strip():
-        answer = qa_result["answer"].strip()
-        return answer, sources
+    if ext_score >= EXTRACTIVE_CONFIDENCE_THRESHOLD and ext_answer:
+        return ext_answer, sources
 
     # Step 2: fall back to generative answer for broader/open-ended questions
     answer = generative_answer(question, context)
